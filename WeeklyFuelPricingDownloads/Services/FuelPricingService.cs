@@ -16,17 +16,15 @@ namespace WeeklyFuelPricingDownloads.Services
         private readonly CancellationTokenSource _cancellationTokenSource = new();
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly ILogger<FuelPricingService> _logger;
-        private readonly IServiceProvider _services;
         private readonly IOptionsMonitor<AppSettings> _appSettings;
         private readonly AsyncPolicy _retryPolicy;
         private readonly FuelPricingContext _dbContext;
 
-        public FuelPricingService(IServiceProvider services, IHttpClientFactory httpClientFactory,
+        public FuelPricingService(IHttpClientFactory httpClientFactory,
             IOptionsMonitor<AppSettings> appSettings, ILogger<FuelPricingService> logger, FuelPricingContext dbContext)
         {
             _httpClientFactory = httpClientFactory;
             _appSettings = appSettings;
-            _services = services;
             _retryPolicy = Policy.Handle<HttpRequestException>()
                 .WaitAndRetryAsync(3, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)));
             _logger = logger;
@@ -40,9 +38,7 @@ namespace WeeklyFuelPricingDownloads.Services
             {
                 try
                 {
-                    var response = await _retryPolicy.ExecuteAsync(() =>
-                        httpClient.GetAsync(_appSettings.CurrentValue.Uri, stoppingToken));
-
+                    var response = await _retryPolicy.ExecuteAsync(() => httpClient.GetAsync(_appSettings.CurrentValue.Uri, stoppingToken));
                     response.EnsureSuccessStatusCode();
 
                     var content = await response.Content.ReadAsStringAsync(stoppingToken);
