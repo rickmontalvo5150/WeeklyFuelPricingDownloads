@@ -1,10 +1,9 @@
 ﻿
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Newtonsoft.Json;
-using Polly;
+using Polly;using Microsoft.EntityFrameworkCore;
 using WeeklyFuelPricingDownloads.DataContext;
 using WeeklyFuelPricingDownloads.Models;
 using WeeklyFuelPricingDownloads.Options;
@@ -17,17 +16,20 @@ namespace WeeklyFuelPricingDownloads.Services
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly ILogger<FuelPricingService> _logger;
         private readonly IServiceProvider _services;
-        private readonly AppSettings _appSettings;
+        private readonly IOptionsMonitor<AppSettings> _appSettings;
         private readonly AsyncPolicy _retryPolicy;
+        private readonly FuelPricingContext _dbContext;
 
-        public FuelPricingService(IServiceProvider services, IHttpClientFactory httpClientFactory, IOptions<AppSettings> appSettings, ILogger<FuelPricingService> logger)
+        public FuelPricingService(IServiceProvider services, IHttpClientFactory httpClientFactory,
+            IOptionsMonitor<AppSettings> appSettings, ILogger<FuelPricingService> logger, FuelPricingContext dbContext)
         {
             _httpClientFactory = httpClientFactory;
-            _appSettings = appSettings.Value;
+            _appSettings = appSettings;
             _services = services;
             _retryPolicy = Policy.Handle<HttpRequestException>()
-                                 .WaitAndRetryAsync(3, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)));
+                .WaitAndRetryAsync(3, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)));
             _logger = logger;
+            _dbContext = dbContext;
         }
 
         public async Task StartAsync(CancellationToken stoppingToken)
@@ -37,24 +39,19 @@ namespace WeeklyFuelPricingDownloads.Services
             {
                 try
                 {
-                    using var scope = _services.CreateScope();
-                    var dbContext = scope.ServiceProvider.GetRequiredService<FuelPricingContext>();
-                    var response = await _retryPolicy.ExecuteAsync(() => httpClient.GetAsync(_appSettings.Uri, stoppingToken));
+                    var response = await _retryPolicy.ExecuteAsync(() =>
+                        httpClient.GetAsync(_appSettings.CurrentValue.Uri, stoppingToken));
 
                     response.EnsureSuccessStatusCode();
 
                     var content = await response.Content.ReadAsStringAsync(stoppingToken);
                     var jsonData = JsonConvert.DeserializeObject<FuelPriceJson>(content);
                     var firstSeries = jsonData?.Response?.Data?.FirstOrDefault();
-                    var cutoffDate = DateTimeOffset.UtcNow.AddDays(-_appSettings.FuelDaysCount);
+                    var cutoffDate = DateTimeOffset.UtcNow.AddDays(-_appSettings.CurrentValue.FuelDaysCount);
 
                     if (firstSeries != null)
                     {
-                        AddNewFuelPriceIfNotExist(dbContext, firstSeries, cutoffDate);
-                        if (dbContext.ChangeTracker.HasChanges())
-                        {
-                            await dbContext.SaveChangesAsync(stoppingToken);
-                        }
+                        await AddNewFuelPriceIfNotExistAsync(firstSeries, cutoffDate);
                     }
                 }
                 catch (Exception ex)
@@ -64,7 +61,7 @@ namespace WeeklyFuelPricingDownloads.Services
 
                 // Wait for either the delay or the token to be cancelled
                 var completedTask = await Task.WhenAny(
-                    Task.Delay(TimeSpan.FromMinutes(_appSettings.DelayBetweenExecutions), stoppingToken),
+                    Task.Delay(TimeSpan.FromMinutes(_appSettings.CurrentValue.DelayBetweenExecutions), stoppingToken),
                     Task.Delay(Timeout.Infinite, stoppingToken));
 
                 // If the stoppingToken was cancelled, exit the loop
@@ -85,19 +82,19 @@ namespace WeeklyFuelPricingDownloads.Services
         public void Dispose()
         {
             _cancellationTokenSource.Dispose();
-            GC.SuppressFinalize(this);
         }
 
-        private static void AddNewFuelPriceIfNotExist(FuelPricingContext dbContext, Data? firstSeries, DateTimeOffset cutoffDate)
+        private async Task AddNewFuelPriceIfNotExistAsync(Data firstSeries, DateTimeOffset cutoffDate)
         {
             var period = firstSeries?.Period;
             if (DateTimeOffset.TryParse(period, out var parsedDate) && parsedDate >= cutoffDate)
             {
-                var existingRecord = dbContext.FuelPrices!.FirstOrDefault(fp => fp.Period == period);
+                var existingRecord = await _dbContext.FuelPrices!.FirstOrDefaultAsync(fp => fp.Period == period);
                 if (existingRecord == null)
                 {
                     var value = firstSeries?.Value ?? 0m;
-                    dbContext.FuelPrices!.Add(new FuelPrices {Period = period, Value = value});
+                    await _dbContext.FuelPrices!.AddAsync(new FuelPrices { Period = period, Value = value });
+                    await _dbContext.SaveChangesAsync();
                 }
             }
         }
